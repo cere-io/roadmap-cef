@@ -1,32 +1,32 @@
 # roadmap-cef
 
-CEF-powered roadmap viewer for the [WIP Roadmap CEF](https://www.notion.so/cere/WIP-Roadmap-CEF-2cbd800083d680c8b22ced2c9c9b1cf2) Notion page.
+Roadmap viewer for the [WIP Roadmap CEF](https://www.notion.so/cere/WIP-Roadmap-CEF-2cbd800083d680c8b22ced2c9c9b1cf2), running on Cere infrastructure.
 
-**Problem:** The current [roadmap app](https://roadmap-six-alpha.vercel.app/) makes 50+ Notion API calls on every page load via a server-side proxy. Slow, fragile, and burns Notion rate limits.
+**Problem:** The current [roadmap app](https://roadmap-six-alpha.vercel.app/) makes 50+ Notion API calls per page load. Slow, fragile, and not on our own stack.
 
-**Solution:** Poll Notion once, cache the result, serve a single JSON endpoint. Frontend loads in one fetch.
+**Solution:** Poll Notion on a schedule, store in Cubbies on DDC, serve via CEF. Frontend loads in one fetch. Every read/write verified by DAC.
 
 ## Architecture
 
 ```
-Notion (source of truth)
+Notion (editing source)
         │
-        ▼
-   ┌─────────┐     ┌──────────────┐     ┌────────────┐
-   │  Poller  │────▶│  Transformer │────▶│   Cache    │
-   │ (crawl)  │     │ (parse)      │     │ (JSON/disk)│
-   └─────────┘     └──────────────┘     └─────┬──────┘
-                                               │
-                                         ┌─────▼──────┐
-                                         │  API Server │  GET /api/roadmap
-                                         └─────┬──────┘
-                                               │
-                                         ┌─────▼──────┐
-                                         │  Frontend   │  React/Vite
-                                         └────────────┘
+        ▼  (poll every 15-30 min)
+   ┌─────────┐     ┌──────────────┐     ┌──────────────────────┐
+   │  Poller  │────▶│  Transformer │────▶│  Cubbies (on DDC)    │
+   │ (crawl)  │     │ (parse)      │     │  + DAC verification  │
+   └─────────┘     └──────────────┘     └──────────┬───────────┘
+                                                    │
+                                              ┌─────▼──────┐
+                                              │  API / CEF  │  GET /api/roadmap
+                                              └─────┬──────┘
+                                                    │
+                                              ┌─────▼──────┐
+                                              │  Frontend   │  React/Vite
+                                              └────────────┘
 ```
 
-**Phase 2 swap:** Replace file cache with Cubbies API on DDC. Same interface, distributed + verifiable storage.
+**Current state:** File-based cache (`src/cache/file-cache.js`) stands in for Cubbies until the DDC integration is wired up. Same `writeCache` / `readCache` interface — swap is a drop-in.
 
 ## What's built (Martijn)
 
@@ -36,51 +36,49 @@ Notion (source of truth)
 | Poller | `src/poller/poll.js` | Done — recursive tree crawl (depth 5), ~50s for full page |
 | Transformer | `src/transformer/transform.js` | Done — Notion blocks → stickies, milestones, lanes |
 | Constants | `src/transformer/constants.js` | Done — 24 lanes, 8 quarters |
-| File cache | `src/cache/file-cache.js` | Done — JSON read/write, designed for Cubbies swap |
+| File cache | `src/cache/file-cache.js` | Done — temp stand-in for Cubbies, same interface |
 | API server | `src/api/server.js` | Done — Express, `/api/roadmap` + `/api/health` |
 | Frontend | `src/frontend/` | Done — React/Vite, reads from `/api/roadmap` |
 
-### Frontend details
-Ported from [Brommah/roadmap](https://github.com/Brommah/roadmap). All Notion API calls stripped out. Single `fetch('/api/roadmap')` replaces 50+ proxied calls.
+### Frontend
+Ported from [Brommah/roadmap](https://github.com/Brommah/roadmap). All Notion API calls stripped. Single `fetch('/api/roadmap')` replaces 50+ proxied calls.
 
-- `App.tsx` — Main app (1186 lines, down from 2808). All rendering, filtering, zoom, drag-drop, modals
+- `App.tsx` — Main app (1186 lines, down from 2808). Rendering, filtering, zoom, drag-drop, modals
 - `constants.tsx` — Lane definitions with icons, quarters, wiki links
 - `types.ts` — StickyNote, Milestone, Lane, Quarter
 - `utils.ts` — Date positioning, lane matching, sorting
 - `components/` — Modal, NotesRenderer, StickyCard, Sidebar
 
-**Tested:** Build passes. API serves cached data. Frontend renders from single endpoint.
-
 ## What Sergey needs to build
 
 ### 1. Cubbies storage adapter (replaces file cache)
-- Expose a Cubbies instance for the roadmap data
-- REST API endpoint that accepts the same JSON structure the poller outputs
-- Read endpoint that returns the full cached object (or a query pattern if preferred)
-- This is the file-cache.js swap — same `writeCache(data)` / `readCache()` interface, backed by Cubbies on DDC
+- Expose a Cubbies instance on DDC for the roadmap data
+- Implement `writeCache(data)` / `readCache()` against Cubbies REST API
+- Drop-in replacement for `src/cache/file-cache.js` — same interface
+- Data structure: single JSON document (stickies, milestones, lanes, quarters, _meta)
 
-### 2. DAC verification on cache writes
-- Each poller write should produce a DAC receipt (Merkle-tree hash of the roadmap snapshot)
-- Receipt ID stored in the `_meta` object alongside `polledAt`, `blockCount`, etc.
-- Enables: "this roadmap data was verified at [timestamp] and hasn't been tampered with"
+### 2. DAC verification on writes
+- Each poller write produces a DAC receipt (Merkle-tree hash of the snapshot)
+- Receipt ID stored in `_meta.dacReceiptId`
+- Frontend can display: "data verified at [timestamp], receipt: [id]"
 
-### 3. CEF hosting (optional, later)
-- Run the API server + poller as a V8 isolate on CEF instead of a standalone Node process
-- Not blocking — the current Express server works fine for now
+### 3. CEF hosting
+- Run the API server as a CEF service instead of standalone Express
+- Poller runs as a scheduled CEF task (every 15-30 min)
+- Frontend served from CEF or built to static + CDN
 
-### 4. Cron / auto-poll
-- Trigger `npm run poll` on a schedule (every 15-30 min)
-- Could be a GitHub Action, a CEF scheduled task, or a simple cron on the Mac Mini
-- Sergey to advise on preferred approach for CEF-native scheduling
+### 4. Cron / auto-poll (interim)
+- Until CEF scheduling is ready, trigger `npm run poll` via GitHub Action or cron
+- Sergey to advise on preferred approach
 
-## Quick start
+## Quick start (with file cache stand-in)
 
 ```bash
 # 1. Clone & install
 git clone https://github.com/cere-io/roadmap-cef.git
 cd roadmap-cef && npm install
 
-# 2. Poll Notion (generates cache)
+# 2. Poll Notion (writes to file cache, will write to Cubbies later)
 NOTION_API_KEY=<key> npm run poll
 
 # 3. Run everything (API + frontend dev server)
@@ -101,8 +99,8 @@ npm run start     # Serves API + built frontend on :3001
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/roadmap` | Full roadmap JSON (stickies, milestones, lanes, quarters) |
-| GET | `/api/health` | Cache status, sticky/milestone counts, last poll timestamp |
+| GET | `/api/roadmap` | Full roadmap JSON from Cubbies (or file cache fallback) |
+| GET | `/api/health` | Cache status, counts, last poll timestamp, DAC receipt |
 
 ## Data model
 
@@ -118,7 +116,7 @@ npm run start     # Serves API + built frontend on :3001
   "milestones": [{ "id": "...", "title": "...", "quarterId": "...", "date": "...", "status": "..." }],
   "lanes": [{ "id": "...", "title": "...", "group": "..." }],
   "quarters": [{ "id": "...", "label": "...", "year": 2026 }],
-  "_meta": { "polledAt": "...", "sourcePageId": "...", "blockCount": 479, "durationMs": 50000 }
+  "_meta": { "polledAt": "...", "sourcePageId": "...", "blockCount": 479, "durationMs": 50000, "dacReceiptId": "..." }
 }
 ```
 
