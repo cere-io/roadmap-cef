@@ -1,20 +1,29 @@
 {
   "name": "@cere-io/roadmap-cef",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "CEF-powered roadmap: Notion → Cache → Fast load",
   "scripts": {
     "poll": "node src/poller/poll.js",
     "serve": "node src/api/server.js",
-    "dev": "concurrently \"node src/api/server.js\" \"cd src/frontend && npx vite\"",
-    "build": "cd src/frontend && npx vite build",
+    "dev": "concurrently \"node src/api/server.js\" \"npx vite --config src/frontend/vite.config.ts\"",
+    "dev:api": "node src/api/server.js",
+    "dev:ui": "npx vite --config src/frontend/vite.config.ts",
+    "build": "npx vite build --config src/frontend/vite.config.ts",
     "start": "node src/api/server.js"
   },
   "dependencies": {
     "express": "^5.2.1",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "lucide-react": "^0.561.0"
   },
   "devDependencies": {
-    "concurrently": "^9.1.0"
+    "@types/node": "^22.14.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "concurrently": "^9.1.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
   }
 }

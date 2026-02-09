@@ -22,7 +22,7 @@ Notion (source of truth)
                                          └─────┬──────┘
                                                │
                                          ┌─────▼──────┐
-                                         │  Frontend   │  (not ported yet)
+                                         │  Frontend   │  React/Vite
                                          └────────────┘
 ```
 
@@ -32,14 +32,24 @@ Notion (source of truth)
 
 | Component | File | Status |
 |-----------|------|--------|
-| Notion client | `src/poller/notion-client.js` | Done — zero-dependency fetch client with pagination |
+| Notion client | `src/poller/notion-client.js` | Done |
 | Poller | `src/poller/poll.js` | Done — recursive tree crawl (depth 5), ~50s for full page |
-| Transformer | `src/transformer/transform.js` | Done — converts Notion blocks → stickies, milestones, lanes |
-| Constants | `src/transformer/constants.js` | Done — 24 lanes, 8 quarters (mirrored from original app) |
+| Transformer | `src/transformer/transform.js` | Done — Notion blocks → stickies, milestones, lanes |
+| Constants | `src/transformer/constants.js` | Done — 24 lanes, 8 quarters |
 | File cache | `src/cache/file-cache.js` | Done — JSON read/write, designed for Cubbies swap |
-| API server | `src/api/server.js` | Done — Express, single `/api/roadmap` endpoint |
+| API server | `src/api/server.js` | Done — Express, `/api/roadmap` + `/api/health` |
+| Frontend | `src/frontend/` | Done — React/Vite, reads from `/api/roadmap` |
 
-**Tested:** Poller crawls 479 blocks, transformer outputs 13 stickies + 1 milestone. API serves cached data correctly.
+### Frontend details
+Ported from [Brommah/roadmap](https://github.com/Brommah/roadmap). All Notion API calls stripped out. Single `fetch('/api/roadmap')` replaces 50+ proxied calls.
+
+- `App.tsx` — Main app (1186 lines, down from 2808). All rendering, filtering, zoom, drag-drop, modals
+- `constants.tsx` — Lane definitions with icons, quarters, wiki links
+- `types.ts` — StickyNote, Milestone, Lane, Quarter
+- `utils.ts` — Date positioning, lane matching, sorting
+- `components/` — Modal, NotesRenderer, StickyCard, Sidebar
+
+**Tested:** Build passes. API serves cached data. Frontend renders from single endpoint.
 
 ## What Sergey needs to build
 
@@ -63,39 +73,28 @@ Notion (source of truth)
 - Could be a GitHub Action, a CEF scheduled task, or a simple cron on the Mac Mini
 - Sergey to advise on preferred approach for CEF-native scheduling
 
-## What's left (Martijn)
-
-### Frontend port
-The current frontend ([Brommah/roadmap](https://github.com/Brommah/roadmap)) is a React/Vite app that parses Notion blocks client-side in a massive `App.tsx`. Need to:
-- Strip out all Notion API proxy calls
-- Replace with single `fetch('/api/roadmap')`
-- Data model already matches — stickies, milestones, lanes, quarters are identical types
-
-### Polish transformer
-- Some stickies may be missed if Notion structure varies (synced blocks, nested toggles)
-- Compare output against live roadmap and fix edge cases
-
 ## Quick start
 
 ```bash
-# 1. Clone
+# 1. Clone & install
 git clone https://github.com/cere-io/roadmap-cef.git
-cd roadmap-cef
+cd roadmap-cef && npm install
 
-# 2. Install
-npm install
-
-# 3. Set env
-cp .env.example .env
-# Add your Notion API key to .env
-
-# 4. Poll Notion (generates cache)
+# 2. Poll Notion (generates cache)
 NOTION_API_KEY=<key> npm run poll
 
-# 5. Serve API
-npm run serve
-# → http://localhost:3001/api/roadmap
-# → http://localhost:3001/api/health
+# 3. Run everything (API + frontend dev server)
+npm run dev
+# API:      http://localhost:3001/api/roadmap
+# Frontend: http://localhost:3000
+
+# Or run separately:
+npm run dev:api   # API on :3001
+npm run dev:ui    # Vite dev on :3000 (proxies /api → :3001)
+
+# Production build
+npm run build     # Outputs to dist/
+npm run start     # Serves API + built frontend on :3001
 ```
 
 ## Endpoints
@@ -107,19 +106,19 @@ npm run serve
 
 ## Data model
 
-The transformer outputs:
-
-```
+```json
 {
-  stickies: [{
-    id, title, owner, laneId, quarterId,
-    status (green/yellow/red), deliveryDate,
-    blocker, wikiUrl, milestoneId, milestoneTitle, notes
+  "stickies": [{
+    "id": "...", "title": "...", "owner": "...",
+    "laneId": "lane-a1", "quarterId": "2026-Q1",
+    "status": "green|yellow|red", "deliveryDate": "2026-03-15",
+    "blocker": "...", "wikiUrl": "...",
+    "milestoneId": "...", "milestoneTitle": "...", "notes": "..."
   }],
-  milestones: [{ id, title, quarterId, date, status }],
-  lanes: [{ id, title, group }],
-  quarters: [{ id, label, year }],
-  _meta: { polledAt, sourcePageId, blockCount, durationMs }
+  "milestones": [{ "id": "...", "title": "...", "quarterId": "...", "date": "...", "status": "..." }],
+  "lanes": [{ "id": "...", "title": "...", "group": "..." }],
+  "quarters": [{ "id": "...", "label": "...", "year": 2026 }],
+  "_meta": { "polledAt": "...", "sourcePageId": "...", "blockCount": 479, "durationMs": 50000 }
 }
 ```
 
