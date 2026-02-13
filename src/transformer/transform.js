@@ -1,19 +1,180 @@
 /**
  * Transform raw Notion block tree into roadmap data model.
  *
- * Replicates the client-side parsing from the original App.tsx,
- * but runs server-side during the poll so the frontend gets clean JSON.
+ * DYNAMIC LANES: Extracts lanes from H2 headers in the Notion doc.
+ * Groups are determined from parent H1 headers or toggle headers.
  */
 
-// Lane definitions (mirrored from original constants.tsx)
-import { CEF_LANES, QUARTERS } from './constants.js';
+import { QUARTERS } from './constants.js';
 
+// Default styling by group (fallback colors)
+const GROUP_STYLES = {
+  'Core Infrastructure': { colorClass: 'bg-blue-50', headerColorClass: 'bg-blue-600' },
+  'Runtimes': { colorClass: 'bg-sky-50', headerColorClass: 'bg-sky-600' },
+  'Product & Demos': { colorClass: 'bg-orange-50', headerColorClass: 'bg-orange-500' },
+  'B3: Marketing': { colorClass: 'bg-blue-50', headerColorClass: 'bg-blue-500' },
+  'B4: Sales': { colorClass: 'bg-green-50', headerColorClass: 'bg-green-500' },
+  'Team & Readiness': { colorClass: 'bg-slate-100', headerColorClass: 'bg-slate-500' },
+  'Blockchain / Protocol': { colorClass: 'bg-purple-50', headerColorClass: 'bg-purple-600' },
+  'DDC': { colorClass: 'bg-sky-50', headerColorClass: 'bg-sky-700' },
+  'Tools': { colorClass: 'bg-orange-50', headerColorClass: 'bg-orange-600' },
+  'Business': { colorClass: 'bg-green-50', headerColorClass: 'bg-green-600' },
+  'default': { colorClass: 'bg-gray-50', headerColorClass: 'bg-gray-500' },
+};
+
+/**
+ * Generate a lane ID from title.
+ * E.g., "Data Onboarding (A1)" → "lane-a1"
+ *       "Agent Runtime (A9)" → "lane-a9"
+ *       "Custom Lane" → "lane-custom-lane"
+ */
+function generateLaneId(title) {
+  // Try to extract code like (A1), (A8b), (Z1), (S0), (B1)
+  const codeMatch = title.match(/\(([A-Z][0-9]+[a-z]?(?:\.\d+)?)\)/i);
+  if (codeMatch) {
+    return `lane-${codeMatch[1].toLowerCase()}`;
+  }
+  // Fallback: slugify the title
+  return 'lane-' + title.toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .substring(0, 30);
+}
+
+/**
+ * Extract subtitle from title if present (after " - " or in parentheses after code)
+ */
+function extractSubtitle(title) {
+  // "Data Onboarding (A1) - Ingestion Service" → "Ingestion Service"
+  const dashMatch = title.match(/-\s*(.+)$/);
+  if (dashMatch) return dashMatch[1].trim();
+  return '';
+}
+
+/**
+ * Get styling for a group
+ */
+function getGroupStyle(group) {
+  // Try exact match first
+  if (GROUP_STYLES[group]) return GROUP_STYLES[group];
+  
+  // Try partial match
+  const groupLower = group.toLowerCase();
+  for (const [key, style] of Object.entries(GROUP_STYLES)) {
+    if (groupLower.includes(key.toLowerCase()) || key.toLowerCase().includes(groupLower)) {
+      return style;
+    }
+  }
+  
+  return GROUP_STYLES['default'];
+}
+
+/**
+ * First pass: Extract all lanes from H2 headers and child_page blocks.
+ * Returns a Map of laneId → lane object
+ */
+function extractLanes(blocks, parentGroup = 'Ungrouped') {
+  const lanesMap = new Map();
+  let currentGroup = parentGroup;
+
+  for (const block of blocks) {
+    const type = block.type;
+    const text = extractText(block);
+
+    // H1 or toggle with ALL CAPS text → likely a group header
+    if ((type === 'heading_1' || type === 'toggle') && text) {
+      // Check if it's a group header (ALL CAPS or known group pattern)
+      const isGroupHeader = text === text.toUpperCase() || 
+        /^(Core|Runtimes|Product|Marketing|Sales|Team|Blockchain|DDC|Tools|Business|B[0-9]:)/i.test(text);
+      
+      if (isGroupHeader && !text.match(/milestone/i)) {
+        currentGroup = text.replace(/^[▶▼]\s*/, '').trim();
+        
+        // If it's a toggle with children, process them with this group
+        if (type === 'toggle' && block._children) {
+          const childLanes = extractLanes(block._children, currentGroup);
+          childLanes.forEach((lane, id) => lanesMap.set(id, lane));
+        }
+        continue;
+      }
+    }
+
+    // H2 or child_page → Lane definition
+    if ((type === 'heading_2' || type === 'child_page') && text) {
+      const laneId = generateLaneId(text);
+      const style = getGroupStyle(currentGroup);
+      
+      // Extract wiki URL from child_page or linked pages
+      let wikiUrl = '';
+      if (type === 'child_page') {
+        wikiUrl = `https://www.notion.so/${block.id.replace(/-/g, '')}`;
+      }
+      
+      // Check for links in rich_text
+      const richText = getRichText(block);
+      for (const rt of richText) {
+        if (rt.href && rt.href.includes('notion.so')) {
+          wikiUrl = rt.href.startsWith('/') ? `https://www.notion.so${rt.href}` : rt.href;
+          break;
+        }
+        if (rt.type === 'mention' && rt.mention?.type === 'page') {
+          wikiUrl = `https://www.notion.so/${rt.mention.page.id.replace(/-/g, '')}`;
+          break;
+        }
+      }
+
+      const lane = {
+        id: laneId,
+        group: currentGroup,
+        title: text,
+        subtitle: extractSubtitle(text),
+        ...style,
+        wikiUrl: wikiUrl || undefined,
+      };
+      
+      // Only add if not already present (first occurrence wins)
+      if (!lanesMap.has(laneId)) {
+        lanesMap.set(laneId, lane);
+      }
+
+      // Process children of child_page for nested content
+      if (type === 'child_page' && block._children) {
+        // Don't extract lanes from children, but process them later for stickies
+      }
+    }
+
+    // Recurse into synced blocks
+    if (type === 'synced_block' && block._children) {
+      const childLanes = extractLanes(block._children, currentGroup);
+      childLanes.forEach((lane, id) => {
+        if (!lanesMap.has(id)) lanesMap.set(id, lane);
+      });
+    }
+  }
+
+  return lanesMap;
+}
+
+/**
+ * Main transform function
+ */
 export function transformBlocks(blocks) {
+  // First pass: Extract all lanes dynamically
+  const lanesMap = extractLanes(blocks);
+  const lanes = Array.from(lanesMap.values());
+  
+  // Sort lanes by group, then by title
+  lanes.sort((a, b) => {
+    if (a.group !== b.group) return a.group.localeCompare(b.group);
+    return a.title.localeCompare(b.title);
+  });
+
+  // Second pass: Extract stickies and milestones
   const stickies = [];
   const milestones = [];
 
   let currentQuarterId = QUARTERS[0].id;
-  let currentLaneId = CEF_LANES[0].id;
+  let currentLaneId = lanes[0]?.id || 'lane-unknown';
   let currentMilestoneId = undefined;
   let currentMilestoneTitle = undefined;
 
@@ -21,34 +182,36 @@ export function transformBlocks(blocks) {
     const type = block.type;
     const text = extractText(block);
 
-    // H1 → Milestone
+    // H1 → Milestone (but not group headers)
     if (type === 'heading_1' && text) {
-      const milestone = parseMilestone(block, text, currentQuarterId);
-      if (milestone) {
-        milestones.push(milestone);
-        currentMilestoneId = milestone.id;
-        currentMilestoneTitle = milestone.title;
-        // Try to detect quarter from milestone title
-        const q = findQuarter(text);
-        if (q) currentQuarterId = q.id;
-      }
-    }
-
-    // H2 → Lane marker
-    if ((type === 'heading_2' || type === 'child_page') && text) {
-      const lane = findLane(text);
-      if (lane) {
-        currentLaneId = lane.id;
-
-        // If child_page, its _children contain checkpoints
-        if (type === 'child_page' && block._children) {
-          processChildPage(block._children, currentLaneId, currentQuarterId,
-            currentMilestoneId, currentMilestoneTitle, stickies);
+      const isGroupHeader = text === text.toUpperCase() && !text.match(/milestone/i);
+      
+      if (!isGroupHeader) {
+        const milestone = parseMilestone(block, text, currentQuarterId);
+        if (milestone) {
+          milestones.push(milestone);
+          currentMilestoneId = milestone.id;
+          currentMilestoneTitle = milestone.title;
+          const q = findQuarter(text);
+          if (q) currentQuarterId = q.id;
         }
       }
     }
 
-    // H3 → Checkpoint / Deliverable (at top level)
+    // H2 or child_page → Lane marker
+    if ((type === 'heading_2' || type === 'child_page') && text) {
+      const laneId = generateLaneId(text);
+      if (lanesMap.has(laneId)) {
+        currentLaneId = laneId;
+
+        if (type === 'child_page' && block._children) {
+          processChildPage(block._children, currentLaneId, currentQuarterId,
+            currentMilestoneId, currentMilestoneTitle, stickies, lanesMap);
+        }
+      }
+    }
+
+    // H3 → Checkpoint / Deliverable
     if (type === 'heading_3' && text) {
       const isCheckpoint = text.toLowerCase().includes('checkpoint') ||
                            text.toLowerCase().startsWith('deliverable');
@@ -61,39 +224,94 @@ export function transformBlocks(blocks) {
       }
     }
 
-    // Synced block at top level — look inside for checkpoints
+    // Synced block → process for checkpoints
     if (type === 'synced_block' && block._children) {
       processSyncedBlock(block._children, currentLaneId, currentQuarterId,
-        currentMilestoneId, currentMilestoneTitle, stickies);
+        currentMilestoneId, currentMilestoneTitle, stickies, lanesMap);
     }
 
-    // Divider → could signal section break (no action needed)
+    // Toggle → might contain lanes or content
+    if (type === 'toggle' && block._children) {
+      // Check if toggle text is a group header
+      const isGroupHeader = text === text.toUpperCase();
+      if (isGroupHeader) {
+        // Process children with updated context
+        processToggleGroup(block._children, text, currentQuarterId,
+          currentMilestoneId, currentMilestoneTitle, stickies, lanesMap);
+      }
+    }
   }
 
-  return { stickies, milestones, lanes: CEF_LANES, quarters: QUARTERS };
+  return { 
+    stickies, 
+    milestones, 
+    lanes,  // Now dynamically generated!
+    quarters: QUARTERS 
+  };
 }
 
 /**
- * Process children of a child_page (lane) to find checkpoints.
+ * Process children of a toggle group
  */
-function processChildPage(children, laneId, quarterId, milestoneId, milestoneTitle, stickies) {
+function processToggleGroup(children, groupName, quarterId, milestoneId, milestoneTitle, stickies, lanesMap) {
+  let currentLaneId = null;
+  
   for (let i = 0; i < children.length; i++) {
     const child = children[i];
     const type = child.type;
     const text = extractText(child);
 
-    // Synced block inside child page
+    // H2 or child_page → Lane
+    if ((type === 'heading_2' || type === 'child_page') && text) {
+      const laneId = generateLaneId(text);
+      if (lanesMap.has(laneId)) {
+        currentLaneId = laneId;
+        
+        if (type === 'child_page' && child._children) {
+          processChildPage(child._children, currentLaneId, quarterId,
+            milestoneId, milestoneTitle, stickies, lanesMap);
+        }
+      }
+    }
+
+    // H3 → Checkpoint
+    if (type === 'heading_3' && text && currentLaneId) {
+      const isCheckpoint = text.toLowerCase().includes('checkpoint') ||
+                           text.toLowerCase().startsWith('deliverable');
+      if (isCheckpoint) {
+        const siblings = collectSiblings(children, i);
+        const sticky = buildSticky(child, text, siblings, currentLaneId,
+          quarterId, milestoneId, milestoneTitle);
+        if (sticky) stickies.push(sticky);
+      }
+    }
+
+    // Synced block
+    if (type === 'synced_block' && child._children && currentLaneId) {
+      processSyncedBlock(child._children, currentLaneId, quarterId,
+        milestoneId, milestoneTitle, stickies, lanesMap);
+    }
+  }
+}
+
+/**
+ * Process children of a child_page (lane) to find checkpoints.
+ */
+function processChildPage(children, laneId, quarterId, milestoneId, milestoneTitle, stickies, lanesMap) {
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i];
+    const type = child.type;
+    const text = extractText(child);
+
     if (type === 'synced_block' && child._children) {
-      processSyncedBlock(child._children, laneId, quarterId, milestoneId, milestoneTitle, stickies);
+      processSyncedBlock(child._children, laneId, quarterId, milestoneId, milestoneTitle, stickies, lanesMap);
       continue;
     }
 
-    // H3 checkpoint
     if (type === 'heading_3' && text) {
       const isCheckpoint = text.toLowerCase().includes('checkpoint') ||
                            text.toLowerCase().startsWith('deliverable');
       if (isCheckpoint) {
-        // Gather sibling blocks after this heading until next heading
         const siblings = collectSiblings(children, i);
         const sticky = buildSticky(child, text, siblings, laneId, quarterId, milestoneId, milestoneTitle);
         if (sticky) stickies.push(sticky);
@@ -105,8 +323,7 @@ function processChildPage(children, laneId, quarterId, milestoneId, milestoneTit
 /**
  * Process children of a synced_block to find checkpoints.
  */
-function processSyncedBlock(children, laneId, quarterId, milestoneId, milestoneTitle, stickies) {
-  // Find checkpoint indices
+function processSyncedBlock(children, laneId, quarterId, milestoneId, milestoneTitle, stickies, lanesMap) {
   const checkpointIndices = [];
   children.forEach((child, idx) => {
     const text = extractText(child);
@@ -151,11 +368,9 @@ function buildSticky(block, rawTitle, siblings, laneId, quarterId, milestoneId, 
     const sibText = richText.map(rt => rt.plain_text).join('');
 
     if (sibText.toLowerCase().startsWith('owner:')) {
-      // Try mention first
       const mention = richText.find(rt => rt.type === 'mention' && rt.mention?.type === 'user');
       owner = mention ? (mention.mention.user?.name || mention.plain_text) : sibText.replace(/^owner[:\s]*/i, '').trim();
     } else if (sibText.toLowerCase().includes('delivery date') || sibText.toLowerCase().includes('delivery:')) {
-      // Try date mention
       const dateMention = richText.find(rt => rt.type === 'mention' && rt.mention?.type === 'date');
       if (dateMention) {
         deliveryDate = dateMention.mention.date.start;
@@ -175,12 +390,10 @@ function buildSticky(block, rawTitle, siblings, laneId, quarterId, milestoneId, 
     } else if (sibText.toLowerCase().startsWith('blocker:') || sibText.toLowerCase().startsWith('blocked:')) {
       blocker = sibText.replace(/^block(?:er|ed)[:\s]*/i, '').trim();
     } else if (sibType === 'toggle') {
-      // Toggle = weekly execution feedback → collect as notes
       const toggleContent = collectToggleContent(sib);
       if (toggleContent) noteItems.push(toggleContent);
     }
 
-    // Extract wiki URL from links
     for (const rt of richText) {
       if (rt.href && rt.href.includes('notion.so')) {
         wikiUrl = rt.href.startsWith('/') ? `https://www.notion.so${rt.href}` : rt.href;
@@ -193,7 +406,6 @@ function buildSticky(block, rawTitle, siblings, laneId, quarterId, milestoneId, 
     }
   }
 
-  // Determine quarter from delivery date
   let assignedQuarter = quarterId;
   if (deliveryDate) {
     const q = getQuarterFromDate(deliveryDate);
@@ -221,15 +433,12 @@ function buildSticky(block, rawTitle, siblings, laneId, quarterId, milestoneId, 
  * Parse a milestone from an H1 block.
  */
 function parseMilestone(block, text, defaultQuarterId) {
-  // Extract title, cleaning "Milestone X:" prefix
   let title = text.replace(/^milestone\s+\d+\s*[:–-]\s*/i, '').trim();
   if (!title) return null;
 
-  // Try to extract date
   const dateMatch = text.match(/(\d{4}-\d{2}-\d{2})/);
   const date = dateMatch ? dateMatch[1] : '';
 
-  // Detect quarter
   const quarter = findQuarter(text);
   const quarterId = quarter ? quarter.id : defaultQuarterId;
 
@@ -266,7 +475,6 @@ function collectSiblings(blocks, startIdx) {
   const siblings = [];
   for (let i = startIdx + 1; i < blocks.length; i++) {
     const block = blocks[i];
-    // Stop at next heading or divider
     if (block.type === 'heading_1' || block.type === 'heading_2' || block.type === 'heading_3' || block.type === 'divider') break;
     siblings.push(block);
   }
@@ -281,7 +489,6 @@ function collectToggleContent(block) {
   for (const child of block._children) {
     const childText = extractText(child);
     if (childText) lines.push(`  ${childText}`);
-    // Nested toggles
     if (child._children) {
       for (const nested of child._children) {
         const nestedText = extractText(nested);
@@ -292,38 +499,6 @@ function collectToggleContent(block) {
   return lines.join('\n');
 }
 
-function findLane(text) {
-  const textUpper = text.toUpperCase();
-  const textLower = text.toLowerCase();
-
-  // Keyword mappings
-  const KEYWORD_LANE_MAP = {
-    's0': 'lane-s0', 'content wiki': 'lane-s0', 'core content': 'lane-s0',
-    's2': 'lane-s2', 'cef website': 'lane-s2', 'website': 'lane-s2',
-    's3': 'lane-s3', 'campaigns': 'lane-s3',
-    's1': 'lane-s1', 'cef demo': 'lane-s1',
-    's4': 'lane-s4', 'enterprise gtm': 'lane-s4',
-  };
-
-  for (const [keyword, laneId] of Object.entries(KEYWORD_LANE_MAP)) {
-    if (textLower.includes(keyword)) {
-      return CEF_LANES.find(l => l.id === laneId);
-    }
-  }
-
-  // Code match (A1, A8b, A8, etc.)
-  const lanesWithCodes = CEF_LANES.map(l => {
-    const match = l.title.match(/\(([A-Z][0-9]+[a-z]?(?:\.\d+)?)\)/i);
-    return { lane: l, code: match?.[1]?.toUpperCase() };
-  }).filter(lc => lc.code).sort((a, b) => (b.code?.length || 0) - (a.code?.length || 0));
-
-  for (const { lane, code } of lanesWithCodes) {
-    if (code && textUpper.includes(code)) return lane;
-  }
-
-  return undefined;
-}
-
 function findQuarter(text) {
   const yearMatch = text.match(/202[5-7]/);
   const qMatch = text.match(/Q[1-4]/i);
@@ -332,7 +507,6 @@ function findQuarter(text) {
     const q = qMatch[0].toUpperCase();
     return QUARTERS.find(qu => qu.year === parseInt(year) && qu.label === q);
   }
-  // Try date match
   const dateMatch = text.match(/(\d{4})-(\d{2})-\d{2}/);
   if (dateMatch) {
     return getQuarterFromDateInternal(dateMatch[0]);

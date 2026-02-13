@@ -8,7 +8,7 @@ import {
   Plus, Flag, Search, ChevronDown, ChevronRight, Save, Trash2,
   Filter, Calendar, Info, CheckCircle, AlertTriangle, BookOpen,
   Folder, FolderOpen, ExternalLink, RefreshCw, Copy, XCircle, Loader2, Globe,
-  ZoomIn, ZoomOut
+  ZoomIn, ZoomOut, Database, Cpu, Rocket, Users, Handshake, Activity, Settings
 } from 'lucide-react';
 import { getUniqueOwners, getUniqueGroups, findLane, findQuarter, getDatePositionInQuarter, sortStickyByDate, getQuarterFromDate, getTodayPosition, extractOutcome } from './utils';
 
@@ -149,12 +149,28 @@ function getColumnWidth(zoomLevel: ZoomLevel): number {
 // App Component
 // ============================================================
 
+// Map group names to icons (since icons can't come from API)
+function getIconForGroup(group: string): React.ReactNode {
+  const groupLower = group.toLowerCase();
+  if (groupLower.includes('infrastructure') || groupLower.includes('core')) return <Database />;
+  if (groupLower.includes('runtime')) return <Cpu />;
+  if (groupLower.includes('product') || groupLower.includes('demo')) return <Rocket />;
+  if (groupLower.includes('marketing')) return <Users />;
+  if (groupLower.includes('sales')) return <Handshake />;
+  if (groupLower.includes('blockchain') || groupLower.includes('protocol')) return <Activity />;
+  if (groupLower.includes('ddc')) return <Database />;
+  if (groupLower.includes('tools')) return <Settings />;
+  if (groupLower.includes('business')) return <Globe />;
+  return <Settings />; // default
+}
+
 export default function App() {
   // -- State --
   const [activeView, setActiveView] = useState<'cef' | 'cere'>('cef');
   const [stickies, setStickies] = useState<StickyNote[]>(INITIAL_STICKIES);
   const [milestones, setMilestones] = useState<Milestone[]>(INITIAL_MILESTONES);
-  const LANES = activeView === 'cef' ? CEF_LANES : CERE_LANES;
+  const [lanes, setLanes] = useState<Lane[]>(CEF_LANES); // Now dynamic from API
+  const LANES = lanes; // Use API lanes (with icon fallback)
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [draggedId, setDraggedId] = useState<string | null>(null);
@@ -165,7 +181,7 @@ export default function App() {
   const [zoomLevel, setZoomLevel] = useState<ZoomLevel>('quarter');
   const [referenceDate, setReferenceDate] = useState<Date>(new Date());
   const timelineColumns = useMemo(() => generateTimelineColumns(zoomLevel, referenceDate), [zoomLevel, referenceDate]);
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set([...CEF_LANES, ...CERE_LANES].map(l => l.group)));
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set()); // Will expand based on content
   const [hasInitializedGroups, setHasInitializedGroups] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingSticky, setEditingSticky] = useState<Partial<StickyNote> | null>(null);
@@ -188,7 +204,13 @@ export default function App() {
         if (!response.ok) throw new Error(`API Error: ${response.statusText}`);
         const data = await response.json();
 
-        // API returns lanes/quarters but we use local constants for icons
+        // Use lanes from API (dynamically extracted from H2 headers)
+        // Add icons since they can't come from JSON
+        const apiLanes = (data.lanes || []).map((lane: Lane) => ({
+          ...lane,
+          icon: getIconForGroup(lane.group),
+        }));
+        setLanes(apiLanes.length > 0 ? apiLanes : CEF_LANES);
         setStickies(data.stickies || []);
         setMilestones(data.milestones || []);
         setLoading(false);
